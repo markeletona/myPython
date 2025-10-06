@@ -1,0 +1,157 @@
+def category_pixels_to_multipolygon(df, category, lat_col='Lat', lon_col='Lon', value_col='MBGCP', verbose=True):
+    """
+    Convert categorical pixel data to MultiPolygon, preserving holes that represent
+    regions of other categories within the target category.
+    """
+    from skimage.measure import label, find_contours
+    from shapely.geometry import Polygon, MultiPolygon
+    from shapely.ops import unary_union
+    import numpy as np
+
+    # Create the lat-lon grid
+    lons = np.sort(df[lon_col].unique())
+    lats = np.sort(df[lat_col].unique())
+    
+    # Create 2D grid of category values
+    value_grid = df.pivot(index=lat_col, columns=lon_col, values=value_col).values
+    
+    # Create binary mask for target category
+    mask = (value_grid == category).astype(np.uint8)
+    
+    # Use 8-connectivity to find connected regions
+    labeled_array, num_features = label(mask, connectivity=2, return_num=True)
+    
+    if verbose:
+        print(f"Category {category}: Found {num_features} separate regions from {np.sum(mask)} pixels")
+    
+    # Calculate grid cell sizes for accurate coordinate conversion
+    if len(lons) > 1:
+        lon_resolution = lons[1] - lons[0]
+    else:
+        lon_resolution = 1.0  # fallback
+    
+    if len(lats) > 1:
+        lat_resolution = lats[1] - lats[0] 
+    else:
+        lat_resolution = 1.0  # fallback
+    
+    def contour_to_polygon(contour, is_exterior=True):
+        """Convert contour coordinates to geographic coordinates and create Polygon."""
+        if len(contour) < 3:
+            return None
+            
+        # Convert array indices to geographic coordinates
+        geographic_coords = []
+        for y_idx, x_idx in contour:
+            lon = lons[0] + x_idx * lon_resolution
+            lat = lats[0] + y_idx * lat_resolution
+            geographic_coords.append((lon, lat))
+        
+        # Close the polygon if not closed
+        if not np.array_equal(geographic_coords[0], geographic_coords[-1]):
+            geographic_coords.append(geographic_coords[0])
+        
+        try:
+            poly = Polygon(geographic_coords)
+            
+            # Ensure correct winding order
+            if not poly.exterior.is_ccw:
+                poly = Polygon(list(poly.exterior.coords)[::-1])
+                
+            if poly.is_valid and poly.area > 0:
+                return poly
+            else:
+                # Try to fix invalid polygon
+                valid_poly = make_valid(poly)
+                if valid_poly.is_valid and valid_poly.area > 0:
+                    return valid_poly
+        except Exception as e:
+            if verbose:
+                print(f"Error creating polygon: {e}")
+        return None
+    
+    # Iterate through features creating polygons
+    all_polygons = []
+    for feature_id in range(1, num_features + 1):
+        
+        # Create mask for this specific feature
+        feature_mask = (labeled_array == feature_id).astype(np.uint8)
+        
+        # If no coordinates assigned to feature, skip (should not be the case, but controls potentials failures/edge cases)
+        if np.sum(feature_mask) == 0:
+            continue
+        
+        # Find all contours for this feature - this will include both exterior and (potentially) interior boundaries
+        contours = find_contours(feature_mask, level=0.5)
+        
+        # Sort contours by area to identify exterior (largest) and interiors (smaller holes)
+        # First, convert to polygon to get the area values
+        contour_polygons = []
+        for contour in contours:
+            # Convert to poly
+            poly = contour_to_polygon(contour)
+            if poly is not None:
+                contour_polygons.append(poly)
+                
+        # Skip if no polygons result from this (again, should not be the case)
+        if not contour_polygons:
+            continue
+        
+        # Now sort by area descending - largest is likely the exterior
+        contour_polygons.sort(key=lambda p: p.area, reverse=True)
+        
+        if len(contour_polygons) == 1:
+            # If just one contour - add as a polygon without holes
+            all_polygons.append(contour_polygons[0])
+        else:
+            # If > 1 contours - treat largest as exterior, others as potential holes
+            exterior = contour_polygons[0]
+            holes = []
+            
+            # Check which holes are actually inside the exterior
+            for hole_candidate in contour_polygons[1:]:
+                if exterior.contains(hole_candidate):
+                    holes.append(hole_candidate.exterior.coords[:-1])  # Remove closing point
+                else:
+                    all_polygons.append(hole_candidate)
+
+            
+            # Create polygon with holes
+            if holes:
+                try:
+                    poly_with_holes = Polygon(exterior.exterior.coords[:-1], holes=holes)
+                    if poly_with_holes.is_valid:
+                        all_polygons.append(poly_with_holes)
+                    else:
+                        # Fallback: use exterior only if holes cause invalidity
+                        all_polygons.append(exterior)
+                except Exception as e:
+                    if verbose:
+                        print(f"Error creating polygon with holes: {e}")
+                    # Fallback: use exterior only
+                    all_polygons.append(exterior)
+            else:
+                all_polygons.append(exterior)
+    
+    if not all_polygons:
+        if verbose:
+            print(f"Category {category}: No valid polygons created")
+        return MultiPolygon()
+    
+    # Merge polygons that touch/overlap
+    merged_result = unary_union(all_polygons)
+    
+    # Convert to MultiPolygon format
+    if merged_result.geom_type == 'Polygon':
+        final_multipolygon = MultiPolygon([merged_result])
+    elif merged_result.geom_type == 'MultiPolygon':
+        final_multipolygon = merged_result
+    else:
+        # Handle GeometryCollection or other types
+        polygons_list = [geom for geom in merged_result.geoms if geom.geom_type == 'Polygon']
+        final_multipolygon = MultiPolygon(polygons_list)
+    
+    if verbose:
+        print(f"Category {category}: Created {len(final_multipolygon.geoms)} polygons with preserved topology")
+    
+    return final_multipolygon
